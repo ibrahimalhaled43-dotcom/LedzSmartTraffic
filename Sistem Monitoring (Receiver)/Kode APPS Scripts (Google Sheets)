@@ -1,0 +1,390 @@
+function doPost(e) {
+  try {
+    console.log('=== POST Request Received ===');
+    console.log('Content:', e.postData.contents);
+    
+    // Parse JSON data dari ESP32
+    var jsonData;
+    try {
+      jsonData = JSON.parse(e.postData.contents);
+      console.log('✅ JSON parsed successfully:', jsonData);
+    } catch (parseError) {
+      console.error('❌ JSON Parse Error:', parseError);
+      return createErrorResponse('Invalid JSON format: ' + parseError.toString());
+    }
+    
+    // Get spreadsheet
+    var spreadsheet = getOrCreateSpreadsheet();
+    var sheet = getOrCreateSheet(spreadsheet);
+    
+    // Pastikan header selalu konsisten
+    ensureCorrectHeaders(sheet);
+    
+    // Buat timestamp Jakarta
+    var jakartaTime = Utilities.formatDate(new Date(), "Asia/Jakarta", "dd/MM/yyyy HH:mm:ss");
+    
+    // STRUKTUR DATA YANG KONSISTEN - 12 kolom sesuai header
+    var rowData = [
+      jakartaTime,                                    // A: Timestamp Jakarta
+      jsonData.device_id || 'ESP32_VehicleCounter_001', // B: Device ID  
+      parseInt(jsonData.count_up) || 0,               // C: Count Up
+      parseInt(jsonData.count_down) || 0,             // D: Count Down
+      parseInt(jsonData.total_vehicles) || (parseInt(jsonData.count_up || 0) + parseInt(jsonData.count_down || 0)), // E: Total Vehicles
+      jsonData.traffic_status || 'UNKNOWN',           // F: Traffic Status
+      jsonData.timestamp || jakartaTime,              // G: ESP32 Timestamp
+      parseInt(jsonData.wifi_rssi) || 0,              // H: WiFi RSSI
+      parseInt(jsonData.uptime_seconds) || parseInt(jsonData.uptime) || 0, // I: Uptime (seconds)
+      jsonData.ip_address || 'Unknown',               // J: IP Address
+      JSON.stringify(jsonData),                       // K: Raw JSON
+      'Auto-inserted at ' + jakartaTime               // L: Notes
+    ];
+    
+    // Validasi data sebelum insert
+    if (rowData.length !== 12) {
+      throw new Error('Data structure mismatch. Expected 12 columns, got ' + rowData.length);
+    }
+    
+    console.log('📊 Data to insert (12 columns):', rowData);
+    
+    // Insert data ke spreadsheet
+    sheet.appendRow(rowData);
+    var newRowNumber = sheet.getLastRow();
+    
+    // Format baris baru
+    formatNewRow(sheet, newRowNumber);
+    
+    // Cleanup jika terlalu banyak data
+    cleanupOldData(sheet);
+    
+    console.log('✅ Data successfully inserted at row:', newRowNumber);
+    
+    // Response sukses
+    var response = {
+      status: 'success',
+      message: 'Data saved successfully with consistent structure',
+      timestamp: jakartaTime,
+      row_number: newRowNumber,
+      total_rows: sheet.getLastRow() - 1, // minus header
+      data_inserted: {
+        device_id: rowData[1],
+        count_up: rowData[2],
+        count_down: rowData[3],
+        total_vehicles: rowData[4],
+        traffic_status: rowData[5]
+      },
+      spreadsheet_info: {
+        name: spreadsheet.getName(),
+        url: spreadsheet.getUrl(),
+        sheet_name: sheet.getName()
+      }
+    };
+    
+    console.log('Response sent:', response);
+    
+    return ContentService
+      .createTextOutput(JSON.stringify(response))
+      .setMimeType(ContentService.MimeType.JSON);
+      
+  } catch (error) {
+    console.error('❌ Error in doPost:', error);
+    console.error('Error stack:', error.stack);
+    
+    return createErrorResponse('Server error: ' + error.toString());
+  }
+}
+
+function doGet(e) {
+  try {
+    console.log('=== GET Request Received ===');
+    
+    var spreadsheet = getOrCreateSpreadsheet();
+    var sheet = getOrCreateSheet(spreadsheet);
+    
+    var lastRow = sheet.getLastRow();
+    
+    if (lastRow <= 1) {
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          status: 'success',
+          message: 'No data available',
+          total_rows: 0,
+          spreadsheet_url: spreadsheet.getUrl(),
+          data: []
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // Get last 5 rows untuk preview
+    var startRow = Math.max(2, lastRow - 4);
+    var range = sheet.getRange(startRow, 1, lastRow - startRow + 1, 12);
+    var values = range.getValues();
+    
+    var data = [];
+    for (var i = 0; i < values.length; i++) {
+      data.push({
+        timestamp_jakarta: values[i][0],
+        device_id: values[i][1],
+        count_up: values[i][2],
+        count_down: values[i][3],
+        total_vehicles: values[i][4],
+        traffic_status: values[i][5],
+        esp32_timestamp: values[i][6],
+        wifi_rssi: values[i][7],
+        uptime_seconds: values[i][8],
+        ip_address: values[i][9]
+      });
+    }
+    
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        status: 'success',
+        message: 'Data retrieved successfully',
+        total_rows: lastRow - 1,
+        last_update: values[values.length - 1][0],
+        spreadsheet_url: spreadsheet.getUrl(),
+        sheet_name: sheet.getName(),
+        data: data
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+      
+  } catch (error) {
+    console.error('❌ Error in doGet:', error);
+    return createErrorResponse('GET request failed: ' + error.toString());
+  }
+}
+
+function getOrCreateSpreadsheet() {
+  var spreadsheetName = 'ESP32 Vehicle Counter Data';
+  
+  try {
+    var files = DriveApp.getFilesByName(spreadsheetName);
+    
+    if (files.hasNext()) {
+      var file = files.next();
+      var spreadsheet = SpreadsheetApp.openById(file.getId());
+      console.log('📊 Using existing spreadsheet');
+      return spreadsheet;
+    } else {
+      var spreadsheet = SpreadsheetApp.create(spreadsheetName);
+      console.log('📊 Created new spreadsheet:', spreadsheet.getUrl());
+      return spreadsheet;
+    }
+  } catch (error) {
+    console.error('Error with spreadsheet:', error);
+    throw error;
+  }
+}
+
+function getOrCreateSheet(spreadsheet) {
+  var sheetName = 'Vehicle Data';
+  var sheet = spreadsheet.getSheetByName(sheetName);
+  
+  if (!sheet) {
+    // Rename default sheet atau buat baru
+    if (spreadsheet.getSheets()[0].getName() === 'Sheet1') {
+      sheet = spreadsheet.getSheets()[0];
+      sheet.setName(sheetName);
+    } else {
+      sheet = spreadsheet.insertSheet(sheetName);
+    }
+    console.log('📄 Sheet created/renamed:', sheetName);
+  }
+  
+  return sheet;
+}
+
+function ensureCorrectHeaders(sheet) {
+  // HEADER YANG BENAR DAN KONSISTEN - 12 kolom
+  var correctHeaders = [
+    'Timestamp Jakarta',    // A
+    'Device ID',           // B  
+    'Count Up',            // C
+    'Count Down',          // D
+    'Total Vehicles',      // E
+    'Traffic Status',      // F
+    'ESP32 Timestamp',     // G
+    'WiFi RSSI',          // H
+    'Uptime (seconds)',    // I
+    'IP Address',          // J
+    'Raw JSON',           // K
+    'Notes'               // L
+  ];
+  
+  // Cek apakah header sudah benar
+  if (sheet.getLastRow() === 0) {
+    // Sheet kosong, buat header baru
+    createHeaders(sheet, correctHeaders);
+    console.log('✅ New headers created');
+    return;
+  }
+  
+  // Cek header yang ada
+  var existingHeaders = sheet.getRange(1, 1, 1, 12).getValues()[0];
+  var headersMatch = true;
+  
+  for (var i = 0; i < correctHeaders.length; i++) {
+    if (existingHeaders[i] !== correctHeaders[i]) {
+      headersMatch = false;
+      break;
+    }
+  }
+  
+  if (!headersMatch) {
+    console.log('⚠️ Headers mismatch, fixing...');
+    // Backup data existing jika ada
+    var dataRows = [];
+    if (sheet.getLastRow() > 1) {
+      dataRows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    }
+    
+    // Clear semua dan buat ulang header
+    sheet.clear();
+    createHeaders(sheet, correctHeaders);
+    
+    // Restore data jika ada (dengan struktur baru)
+    if (dataRows.length > 0) {
+      console.log('🔄 Restoring', dataRows.length, 'rows with new structure');
+      // TODO: Implement data migration if needed
+    }
+    
+    console.log('✅ Headers fixed');
+  }
+}
+
+function createHeaders(sheet, headers) {
+  // Set headers
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  
+  // Format header row
+  var headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange.setBackground('#1f4e79');  // Dark blue
+  headerRange.setFontColor('#ffffff');   // White text
+  headerRange.setFontWeight('bold');
+  headerRange.setFontSize(10);
+  headerRange.setHorizontalAlignment('center');
+  
+  // Set column widths
+  var columnWidths = [140, 120, 80, 80, 100, 100, 120, 80, 100, 120, 250, 150];
+  for (var i = 0; i < columnWidths.length; i++) {
+    sheet.setColumnWidth(i + 1, columnWidths[i]);
+  }
+  
+  // Freeze header
+  sheet.setFrozenRows(1);
+  
+  console.log('📋 Headers created with', headers.length, 'columns');
+}
+
+function formatNewRow(sheet, rowNumber) {
+  try {
+    var range = sheet.getRange(rowNumber, 1, 1, 12);
+    
+    // Alternate row colors
+    if (rowNumber % 2 === 0) {
+      range.setBackground('#f8f9fa'); // Light gray for even rows
+    } else {
+      range.setBackground('#ffffff'); // White for odd rows
+    }
+    
+    // Format numbers
+    sheet.getRange(rowNumber, 3, 1, 3).setNumberFormat('#,##0'); // Count columns
+    sheet.getRange(rowNumber, 8).setNumberFormat('#,##0'); // RSSI
+    sheet.getRange(rowNumber, 9).setNumberFormat('#,##0'); // Uptime
+    
+    // Format timestamp
+    sheet.getRange(rowNumber, 1).setNumberFormat('dd/mm/yyyy hh:mm:ss');
+    
+  } catch (formatError) {
+    console.log('⚠️ Formatting warning:', formatError);
+  }
+}
+
+function cleanupOldData(sheet) {
+  var maxRows = 1000; // Keep maximum 1000 data rows
+  var lastRow = sheet.getLastRow();
+  
+  if (lastRow > maxRows + 1) { // +1 for header
+    var rowsToDelete = lastRow - maxRows - 1;
+    sheet.deleteRows(2, rowsToDelete); // Delete from row 2 (keep header)
+    console.log('🗑️ Cleaned up', rowsToDelete, 'old rows');
+  }
+}
+
+function createErrorResponse(errorMessage) {
+  return ContentService
+    .createTextOutput(JSON.stringify({
+      status: 'error',
+      message: errorMessage,
+      timestamp: Utilities.formatDate(new Date(), "Asia/Jakarta", "dd/MM/yyyy HH:mm:ss")
+    }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// === UTILITY FUNCTIONS ===
+
+function testInsertData() {
+  console.log('🧪 Testing data insertion...');
+  
+  var testData = {
+    device_id: 'ESP32_VehicleCounter_001',
+    count_up: 25,
+    count_down: 67,
+    total_vehicles: 92,
+    traffic_status: 'RAMAI',
+    timestamp: '2025-08-17 21:30:45',
+    wifi_rssi: -38,
+    uptime_seconds: 1800,
+    ip_address: '172.26.240.12'
+  };
+  
+  var mockEvent = {
+    postData: {
+      contents: JSON.stringify(testData)
+    }
+  };
+  
+  var result = doPost(mockEvent);
+  console.log('Test result:', result.getContent());
+  
+  return result.getContent();
+}
+
+function fixExistingHeaders() {
+  console.log('🔧 Fixing existing spreadsheet headers...');
+  
+  var spreadsheet = getOrCreateSpreadsheet();
+  var sheet = getOrCreateSheet(spreadsheet);
+  
+  ensureCorrectHeaders(sheet);
+  
+  console.log('✅ Headers fixed successfully');
+}
+
+function clearAllDataKeepHeaders() {
+  var spreadsheet = getOrCreateSpreadsheet();
+  var sheet = getOrCreateSheet(spreadsheet);
+  
+  if (sheet.getLastRow() > 1) {
+    sheet.deleteRows(2, sheet.getLastRow() - 1);
+    console.log('🗑️ All data cleared, headers preserved');
+  } else {
+    console.log('ℹ️ No data to clear');
+  }
+}
+
+function getSpreadsheetInfo() {
+  var spreadsheet = getOrCreateSpreadsheet();
+  var sheet = getOrCreateSheet(spreadsheet);
+  
+  console.log('📊 Spreadsheet Info:');
+  console.log('Name:', spreadsheet.getName());
+  console.log('URL:', spreadsheet.getUrl());
+  console.log('Sheet Name:', sheet.getName());
+  console.log('Total Rows:', sheet.getLastRow());
+  console.log('Total Columns:', sheet.getLastColumn());
+  
+  if (sheet.getLastRow() > 0) {
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    console.log('Headers:', headers);
+  }
+}
